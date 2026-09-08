@@ -1,0 +1,97 @@
+name: MigrateGuard
+
+on:
+  pull_request:
+    paths:
+      - "**/migrations/**.sql"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check-migrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install MigrateGuard
+        run: pip install .
+
+      - name: Find migration directories touched by this PR
+        id: dirs
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- '**/migrations/**.sql')
+          dirs=$(echo "$changed" | xargs -n1 dirname 2>/dev/null | sort -u | tr '\n' ' ')
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+
+      - name: Run migrateguard
+        id: migrateguard
+        if: steps.dirs.outputs.dirs != ''
+        run: |
+          set +e
+          report=""
+          exit_code=0
+          for d in ${{ steps.dirs.outputs.dirs }}; do
+            out=$(migrateguard check "$d")
+            status=$?
+            report="$report
+
+          ### \`$d\`
+          \`\`\`
+          $out
+          \`\`\`"
+            if [ "$status" -ne 0 ]; then exit_code=1; fi
+          done
+          {
+            echo 'report<<MIGRATEGUARD_EOF'
+            echo "$report"
+            echo 'MIGRATEGUARD_EOF'
+          } >> "$GITHUB_OUTPUT"
+          exit $exit_code
+
+      - name: Comment on PR
+        if: always() && steps.dirs.outputs.dirs != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const report = `${{ steps.migrateguard.outputs.report }}`;
+            const body = `## MigrateGuard\n${report || 'No breaking changes detected.'}`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.startsWith('## MigrateGuard'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail if breaking changes found and not overridden
+        if: always() && steps.dirs.outputs.dirs != ''
+        run: |
+          if [ "${{ steps.migrateguard.outcome }}" = "failure" ]; then
+            if [ "${{ contains(github.event.pull_request.labels.*.name, 'migration-override') }}" = "true" ]; then
+              echo "Breaking changes found but PR is labeled 'migration-override' — passing."
+              exit 0
+            fi
+            echo "Breaking migration changes detected. Add the 'migration-override' label to bypass."
+            exit 1
+          fi
